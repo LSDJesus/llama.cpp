@@ -68,6 +68,7 @@ struct llama_context {
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
+    float * get_embeddings_penultimate_ith(int32_t i); // [Luna] penultimate layer
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -261,6 +262,10 @@ private:
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
+
+    // [Luna] penultimate layer embeddings (pre-norm, matches HF hidden_states[-2])
+    // populated only when embeddings == true and model provides t_embd_penultimate
+    buffer_view<float> embd_penultimate = {nullptr, 0};
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

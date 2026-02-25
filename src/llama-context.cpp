@@ -860,6 +860,28 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+// [Luna] Get penultimate layer (pre-norm) embeddings for the ith token
+float * llama_context::get_embeddings_penultimate_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (embd_penultimate.data == nullptr) {
+            throw std::runtime_error("no penultimate embeddings");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        const uint32_t n_embd_dim = model.hparams.n_embd;
+        return embd_penultimate.data + j*n_embd_dim;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid penultimate embeddings id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1379,6 +1401,19 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
+    // [Luna] extract penultimate layer embeddings (pre-norm hidden states)
+    {
+        auto * t_embd_pen = res->get_embd_penultimate();
+        if (embd_penultimate.data && t_embd_pen) {
+            ggml_backend_t backend_pen = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd_pen);
+            GGML_ASSERT(backend_pen != nullptr);
+            GGML_ASSERT(embd_penultimate.data != nullptr);
+            const uint32_t n_embd_dim = hparams.n_embd;
+            GGML_ASSERT(n_tokens*n_embd_dim <= (int64_t) embd_penultimate.size);
+            ggml_backend_tensor_get_async(backend_pen, t_embd_pen, embd_penultimate.data, 0, n_tokens*n_embd_dim*sizeof(float));
+        }
+    }
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -1809,6 +1844,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // [Luna] extract penultimate layer embeddings (batched decode path)
+        {
+            auto * t_embd_pen = res->get_embd_penultimate();
+            if (embd_penultimate.data && t_embd_pen && n_outputs > 0) {
+                ggml_backend_t backend_pen = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd_pen);
+                GGML_ASSERT(backend_pen != nullptr);
+                const uint32_t n_embd_dim = hparams.n_embd;
+                float * pen_out = embd_penultimate.data + n_outputs_prev*n_embd_dim;
+                if (n_outputs) {
+                    GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                    GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_dim <= (int64_t) embd_penultimate.size);
+                    ggml_backend_tensor_get_async(backend_pen, t_embd_pen, pen_out, 0, n_outputs*n_embd_dim*sizeof(float));
+                }
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -1910,6 +1961,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
+    embd_penultimate.size = has_embd ? hparams.n_embd*n_outputs_max : 0; // [Luna] penultimate layer buffer
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -1925,8 +1977,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + backend_float_count) * sizeof(float) +
-        (                          backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_penultimate.size + backend_float_count) * sizeof(float) +
+        (                                                   backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -1942,6 +1994,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             buf_output = nullptr;
             logits.data = nullptr;
             embd.data = nullptr;
+            embd_penultimate.data = nullptr;
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -1969,6 +2022,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
+
+    // [Luna] penultimate layer buffer
+    embd_penultimate = has_embd ? buffer_view<float>{(float *) (base + offset), embd_penultimate.size} : buffer_view<float>{nullptr, 0};
+    offset += embd_penultimate.size * sizeof(float);
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2031,6 +2088,13 @@ void llama_context::output_reorder() {
         if (embd.size > 0) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
+            }
+        }
+
+        // [Luna] reorder penultimate embeddings alongside normal embeddings
+        if (embd_penultimate.size > 0) {
+            for (uint64_t k = 0; k < n_embd; k++) {
+                std::swap(embd_penultimate.data[i0*n_embd + k], embd_penultimate.data[i1*n_embd + k]);
             }
         }
 
@@ -3179,6 +3243,13 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+// [Luna] Get penultimate layer (pre-norm) embeddings for the ith token
+float * llama_get_embeddings_penultimate_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_penultimate_ith(i);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

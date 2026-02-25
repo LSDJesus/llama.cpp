@@ -1001,6 +1001,13 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 
+    // [Luna] Get the penultimate layer (pre-norm) embeddings for the ith token.
+    // Returns the hidden state BEFORE the final RMSNorm, matching HuggingFace hidden_states[-2].
+    // This is the embedding space Z-Image was trained on.
+    // shape: [n_embd] (1-dimensional)
+    // Returns NULL if the model does not provide penultimate embeddings or embeddings are not enabled.
+    LLAMA_API float * llama_get_embeddings_penultimate_ith(struct llama_context * ctx, int32_t i);
+
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence

@@ -805,6 +805,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_embd_penultimate = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -839,6 +840,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
+    }
+    if (t_embd_penultimate != nullptr) {
+        ggml_set_output(t_embd_penultimate);
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);

@@ -105,6 +105,13 @@ llm_build_qwen3vl::llm_build_qwen3vl(const llama_model & model, const llm_graph_
 
     cur = inpL;
 
+    // [Luna] Store the pre-norm residual stream as penultimate layer output.
+    // This matches HuggingFace hidden_states[-2] which Z-Image uses for conditioning.
+    if (cparams.embeddings) {
+        res->t_embd_penultimate = cur;
+        cb(res->t_embd_penultimate, "result_penultimate", -1);
+    }
+
     cur = build_norm(cur,
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);

@@ -642,8 +642,9 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
-    ggml_tensor * get_embd()        const { return t_embd; }
-    ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_embd()             const { return t_embd; }
+    ggml_tensor * get_embd_pooled()      const { return t_embd_pooled; }
+    ggml_tensor * get_embd_penultimate() const { return t_embd_penultimate; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -670,8 +671,9 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_embd              = nullptr;
+    ggml_tensor * t_embd_pooled       = nullptr;
+    ggml_tensor * t_embd_penultimate  = nullptr; // [Luna] pre-norm penultimate layer output
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
