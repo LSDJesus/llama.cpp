@@ -19,6 +19,12 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // [Luna] layer skip — pass hidden state through unchanged
+        if (layer_skip && il < (int) layer_skip->size() && (*layer_skip)[il]) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -84,6 +90,15 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        // [Luna] per-layer hidden state capture
+        if (layer_capture && il < (int) layer_capture->size() && (*layer_capture)[il]) {
+            if (res->t_embd_layers.empty()) {
+                res->t_embd_layers.resize(n_layer, nullptr);
+            }
+            res->t_embd_layers[il] = cur;
+            cb(cur, "result_layer", il);
+        }
 
         // input for next layer
         inpL = cur;

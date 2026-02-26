@@ -806,6 +806,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_embd_penultimate = nullptr;
+    t_embd_layers.clear();
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -843,6 +844,12 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_penultimate != nullptr) {
         ggml_set_output(t_embd_penultimate);
+    }
+    // [Luna] mark per-layer capture tensors as outputs
+    for (auto * t : t_embd_layers) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
@@ -950,6 +957,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    layer_capture    (params.layer_capture),
+    layer_skip       (params.layer_skip),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

@@ -882,6 +882,58 @@ float * llama_context::get_embeddings_penultimate_ith(int32_t i) {
     }
 }
 
+// [Luna] Get hidden state from a specific layer for the ith token
+float * llama_context::get_embeddings_layer_ith(int32_t layer, int32_t i) {
+    output_reorder();
+
+    try {
+        if (layer < 0 || layer >= (int32_t) embd_layers.size()) {
+            throw std::runtime_error("layer index out of range");
+        }
+        if (embd_layers[layer].data == nullptr) {
+            throw std::runtime_error("layer not captured");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        const uint32_t n_embd_dim = model.hparams.n_embd;
+        return embd_layers[layer].data + j*n_embd_dim;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid layer embeddings layer=%d id=%d, reason: %s\n", __func__, layer, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
+// [Luna] Set which layers to capture hidden states from
+void llama_context::set_layer_capture(const std::vector<bool> & mask) {
+    layer_capture = mask;
+    sched_need_reserve = true; // graph topology may change
+
+    // Force output buffer reallocation so per-layer buffers get sized
+    synchronize();
+    buf_output = nullptr;
+    logits.data = nullptr;
+    embd.data = nullptr;
+    embd_penultimate.data = nullptr;
+    for (auto & el : embd_layers) {
+        el.data = nullptr;
+    }
+}
+
+// [Luna] Set which layers to skip during inference
+void llama_context::set_layer_skip(const std::vector<bool> & mask) {
+    layer_skip = mask;
+    sched_need_reserve = true; // graph topology may change
+}
+
+// [Luna] Get the number of transformer layers
+int32_t llama_context::get_n_layer() const {
+    return (int32_t) model.hparams.n_layer;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1414,6 +1466,20 @@ int llama_context::encode(const llama_batch & batch_inp) {
         }
     }
 
+    // [Luna] extract per-layer hidden states (encode path)
+    {
+        const uint32_t n_embd_dim = hparams.n_embd;
+        for (uint32_t il = 0; il < (uint32_t) embd_layers.size(); ++il) {
+            auto * t_layer = res->get_embd_layer(il);
+            if (embd_layers[il].data && t_layer) {
+                ggml_backend_t backend_layer = ggml_backend_sched_get_tensor_backend(sched.get(), t_layer);
+                GGML_ASSERT(backend_layer != nullptr);
+                GGML_ASSERT(n_tokens*n_embd_dim <= (int64_t) embd_layers[il].size);
+                ggml_backend_tensor_get_async(backend_layer, t_layer, embd_layers[il].data, 0, n_tokens*n_embd_dim*sizeof(float));
+            }
+        }
+    }
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -1860,6 +1926,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // [Luna] extract per-layer hidden states (batched decode path)
+        {
+            const uint32_t n_embd_dim = hparams.n_embd;
+            for (uint32_t il = 0; il < (uint32_t) embd_layers.size(); ++il) {
+                auto * t_layer = res->get_embd_layer(il);
+                if (embd_layers[il].data && t_layer && n_outputs > 0) {
+                    ggml_backend_t backend_layer = ggml_backend_sched_get_tensor_backend(sched.get(), t_layer);
+                    GGML_ASSERT(backend_layer != nullptr);
+                    float * layer_out = embd_layers[il].data + n_outputs_prev*n_embd_dim;
+                    if (n_outputs) {
+                        GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                        GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_dim <= (int64_t) embd_layers[il].size);
+                        ggml_backend_tensor_get_async(backend_layer, t_layer, layer_out, 0, n_outputs*n_embd_dim*sizeof(float));
+                    }
+                }
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -1955,6 +2039,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         has_embd   = true;
     }
 
+    // [Luna] Layer capture needs output buffers allocated even without embeddings mode.
+    // This decouples buffer allocation from the output_all behavior in decode(),
+    // so layer hidden states can be captured WITHOUT corrupting logits by forcing
+    // all tokens as outputs.
+    bool has_layer_capture_active = false;
+    for (size_t il = 0; il < layer_capture.size(); ++il) {
+        if (layer_capture[il]) { has_layer_capture_active = true; break; }
+    }
+    const bool has_embd_or_capture = has_embd || has_layer_capture_active;
 
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
@@ -1962,6 +2055,22 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
     embd_penultimate.size = has_embd ? hparams.n_embd*n_outputs_max : 0; // [Luna] penultimate layer buffer
+
+    // [Luna] per-layer capture buffer sizing
+    // Uses has_embd_or_capture: buffers are allocated when layer capture is active,
+    // even if cparams.embeddings is false. This allows capturing hidden states
+    // while keeping logits correct for generation.
+    const uint32_t n_layer = hparams.n_layer;
+    size_t layer_capture_total = 0;
+    embd_layers.resize(n_layer);
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (has_embd_or_capture && il < layer_capture.size() && layer_capture[il]) {
+            embd_layers[il].size = hparams.n_embd * n_outputs_max;
+        } else {
+            embd_layers[il].size = 0;
+        }
+        layer_capture_total += embd_layers[il].size;
+    }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
@@ -1977,8 +2086,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_penultimate.size + backend_float_count) * sizeof(float) +
-        (                                                   backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_penultimate.size + layer_capture_total + backend_float_count) * sizeof(float) +
+        (                                                                        backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -1995,6 +2104,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_penultimate.data = nullptr;
+            for (auto & el : embd_layers) {
+                el.data = nullptr;
+            }
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -2026,6 +2138,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // [Luna] penultimate layer buffer
     embd_penultimate = has_embd ? buffer_view<float>{(float *) (base + offset), embd_penultimate.size} : buffer_view<float>{nullptr, 0};
     offset += embd_penultimate.size * sizeof(float);
+
+    // [Luna] per-layer capture buffers
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (embd_layers[il].size > 0) {
+            embd_layers[il] = buffer_view<float>{(float *) (base + offset), embd_layers[il].size};
+            offset += embd_layers[il].size * sizeof(float);
+        } else {
+            embd_layers[il] = buffer_view<float>{nullptr, 0};
+        }
+    }
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2095,6 +2217,15 @@ void llama_context::output_reorder() {
         if (embd_penultimate.size > 0) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_penultimate.data[i0*n_embd + k], embd_penultimate.data[i1*n_embd + k]);
+            }
+        }
+
+        // [Luna] reorder per-layer capture embeddings
+        for (auto & el : embd_layers) {
+            if (el.size > 0) {
+                for (uint64_t k = 0; k < n_embd; k++) {
+                    std::swap(el.data[i0*n_embd + k], el.data[i1*n_embd + k]);
+                }
             }
         }
 
@@ -2215,21 +2346,23 @@ llm_graph_params llama_context::graph_params(
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
     return {
-        /*.arch        =*/ model.arch,
-        /*.hparams     =*/ model.hparams,
-        /*.cparams     =*/ cparams,
-        /*.ubatch      =*/ ubatch,
-        /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
-        /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.arch          =*/ model.arch,
+        /*.hparams       =*/ model.hparams,
+        /*.cparams       =*/ cparams,
+        /*.ubatch        =*/ ubatch,
+        /*.gtype         =*/ gtype,
+        /*.sched         =*/ sched.get(),
+        /*.backend_cpu   =*/ backend_cpu,
+        /*.cvec          =*/ cvec.get(),
+        /*.loras         =*/ loras.get(),
+        /*.mctx          =*/ mctx,
+        /*.cross         =*/ &cross,
+        /*.layer_capture =*/ layer_capture.empty() ? nullptr : &layer_capture,
+        /*.layer_skip    =*/ layer_skip.empty()    ? nullptr : &layer_skip,
+        /*.samplers      =*/ sampling.samplers,
+        /*.n_outputs     =*/ n_outputs,
+        /*.cb            =*/ graph_get_cb(),
+        /*.res           =*/ res,
     };
 }
 
@@ -3250,6 +3383,36 @@ float * llama_get_embeddings_penultimate_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_penultimate_ith(i);
+}
+
+// [Luna] Get hidden state from a specific layer for the ith token
+float * llama_get_embeddings_layer_ith(llama_context * ctx, int32_t layer, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_layer_ith(layer, i);
+}
+
+// [Luna] Set which layers to capture hidden states from
+void llama_set_layer_capture(llama_context * ctx, const bool * mask, int32_t n_layers) {
+    if (mask == nullptr || n_layers <= 0) {
+        ctx->set_layer_capture({});
+    } else {
+        ctx->set_layer_capture(std::vector<bool>(mask, mask + n_layers));
+    }
+}
+
+// [Luna] Set which layers to skip during inference
+void llama_set_layer_skip(llama_context * ctx, const bool * mask, int32_t n_layers) {
+    if (mask == nullptr || n_layers <= 0) {
+        ctx->set_layer_skip({});
+    } else {
+        ctx->set_layer_skip(std::vector<bool>(mask, mask + n_layers));
+    }
+}
+
+// [Luna] Get the number of transformer layers
+int32_t llama_get_n_layer(llama_context * ctx) {
+    return ctx->get_n_layer();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

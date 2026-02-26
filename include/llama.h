@@ -1008,6 +1008,25 @@ extern "C" {
     // Returns NULL if the model does not provide penultimate embeddings or embeddings are not enabled.
     LLAMA_API float * llama_get_embeddings_penultimate_ith(struct llama_context * ctx, int32_t i);
 
+    // [Luna] Get the hidden state output of a specific transformer layer for the ith token.
+    // Requires llama_set_layer_capture() to have been called with the layer enabled.
+    // shape: [n_embd] (1-dimensional)
+    // Returns NULL if the layer was not captured or embeddings are not enabled.
+    LLAMA_API float * llama_get_embeddings_layer_ith(struct llama_context * ctx, int32_t layer, int32_t i);
+
+    // [Luna] Set which layers to capture hidden states from during inference.
+    // mask: boolean array of length n_layers (true = capture this layer's output).
+    // Pass NULL to disable all layer capture.
+    LLAMA_API void llama_set_layer_capture(struct llama_context * ctx, const bool * mask, int32_t n_layers);
+
+    // [Luna] Set which layers to skip during inference.
+    // mask: boolean array of length n_layers (true = skip this layer).
+    // Pass NULL to disable all layer skipping.
+    LLAMA_API void llama_set_layer_skip(struct llama_context * ctx, const bool * mask, int32_t n_layers);
+
+    // [Luna] Get the number of transformer layers in the model.
+    LLAMA_API int32_t llama_get_n_layer(struct llama_context * ctx);
+
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence

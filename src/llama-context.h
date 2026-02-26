@@ -69,6 +69,12 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
     float * get_embeddings_penultimate_ith(int32_t i); // [Luna] penultimate layer
+    float * get_embeddings_layer_ith(int32_t layer, int32_t i); // [Luna] per-layer hidden states
+
+    // [Luna] set which layers to capture / skip (pass empty vector to disable)
+    void set_layer_capture(const std::vector<bool> & mask);
+    void set_layer_skip(const std::vector<bool> & mask);
+    int32_t get_n_layer() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -266,6 +272,14 @@ private:
     // [Luna] penultimate layer embeddings (pre-norm, matches HF hidden_states[-2])
     // populated only when embeddings == true and model provides t_embd_penultimate
     buffer_view<float> embd_penultimate = {nullptr, 0};
+
+    // [Luna] per-layer hidden state capture buffers
+    // indexed by layer number, only allocated for captured layers
+    std::vector<buffer_view<float>> embd_layers;
+
+    // [Luna] per-layer control masks (sized n_layer when active, empty when disabled)
+    std::vector<bool> layer_capture; // which layers to capture hidden states from
+    std::vector<bool> layer_skip;    // which layers to skip during inference
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

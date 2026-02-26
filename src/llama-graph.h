@@ -545,6 +545,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // [Luna] per-layer control masks
+    const std::vector<bool> * layer_capture = nullptr;
+    const std::vector<bool> * layer_skip    = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -630,7 +634,9 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            layer_capture == other.layer_capture &&
+            layer_skip    == other.layer_skip;
     }
 };
 
@@ -645,6 +651,7 @@ public:
     ggml_tensor * get_embd()             const { return t_embd; }
     ggml_tensor * get_embd_pooled()      const { return t_embd_pooled; }
     ggml_tensor * get_embd_penultimate() const { return t_embd_penultimate; }
+    ggml_tensor * get_embd_layer(int il) const { return (il >= 0 && il < (int)t_embd_layers.size()) ? t_embd_layers[il] : nullptr; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -674,6 +681,10 @@ public:
     ggml_tensor * t_embd              = nullptr;
     ggml_tensor * t_embd_pooled       = nullptr;
     ggml_tensor * t_embd_penultimate  = nullptr; // [Luna] pre-norm penultimate layer output
+
+    // [Luna] per-layer hidden state tensors for layer capture
+    // indexed by layer number, nullptr for non-captured layers
+    std::vector<ggml_tensor *> t_embd_layers;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -760,6 +771,10 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // [Luna] per-layer control masks (sized n_layer, empty = disabled)
+    const std::vector<bool> * layer_capture; // which layers to capture hidden states from
+    const std::vector<bool> * layer_skip;    // which layers to skip during inference
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
