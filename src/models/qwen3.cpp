@@ -119,11 +119,12 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur);
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    // lm_head — skip if output.weight was not loaded (embedding-only mode)
+    if (model.output != nullptr) {
+        cur = build_lora_mm(model.output, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
