@@ -105,8 +105,12 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
-    // [Luna] Store the pre-norm residual stream as penultimate layer output.
-    // This matches HuggingFace hidden_states[-2] which Z-Image uses for conditioning.
+    // [Luna] Capture the residual stream after the last transformer block, before the final RMS norm.
+    // HuggingFace convention: this is hidden_states[-2].
+    //   hidden_states[-1] = last_hidden_state (post output_norm, before lm_head)
+    //   hidden_states[-2] = output of the last transformer block (attn + FFN + residual),
+    //                        BEFORE output_norm is applied  ← we capture here
+    // NOT the second-to-last block. This is block n_layer-1, pre-norm.
     if (cparams.embeddings) {
         res->t_embd_penultimate = cur;
         cb(res->t_embd_penultimate, "result_penultimate", -1);

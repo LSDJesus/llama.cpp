@@ -860,7 +860,8 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
-// [Luna] Get penultimate layer (pre-norm) embeddings for the ith token
+// [Luna] Get hidden_states[-2] for the ith token: output of the last transformer block,
+// before the final RMS norm (output_norm). In HF terms: hidden_states[-2], NOT last_hidden_state.
 float * llama_context::get_embeddings_penultimate_ith(int32_t i) {
     output_reorder();
 
