@@ -24,6 +24,12 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // [Luna] layer skip — pass hidden state through unchanged
+        if (layer_skip && il < (int) layer_skip->size() && (*layer_skip)[il]) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -67,10 +73,30 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // [Luna] per-layer hidden state capture
+        if (layer_capture && il < (int) layer_capture->size() && (*layer_capture)[il]) {
+            if (res->t_embd_layers.empty()) {
+                res->t_embd_layers.resize(n_layer, nullptr);
+            }
+            res->t_embd_layers[il] = cur;
+            cb(cur, "result_layer", il);
+        }
+
         // Input for next layer
         inpL = cur;
     }
     cur = inpL;
+
+    // [Luna] Capture the residual stream after the last transformer block, before the final RMS norm.
+    // HuggingFace convention: this is hidden_states[-2].
+    //   hidden_states[-1] = last_hidden_state (post output_norm, before lm_head)
+    //   hidden_states[-2] = output of the last transformer block (attn/SSM + FFN + residual),
+    //                        BEFORE output_norm is applied  ← we capture here
+    // NOTE: Qwen3.5 is a hybrid SSM/Transformer model; recurrent layers contribute to this.
+    if (cparams.embeddings) {
+        res->t_embd_penultimate = cur;
+        cb(res->t_embd_penultimate, "result_penultimate", -1);
+    }
 
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -78,11 +104,12 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // LM head
-    cur = build_lora_mm(model.output, cur);
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+    // lm_head — skip if output.weight was not loaded (embedding-only mode)
+    if (model.output != nullptr) {
+        cur = build_lora_mm(model.output, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
