@@ -1009,6 +1009,29 @@ extern "C" {
     // Returns NULL if the model does not provide penultimate embeddings or embeddings are not enabled.
     LLAMA_API float * llama_get_embeddings_penultimate_ith(struct llama_context * ctx, int32_t i);
 
+    // [Luna] Accumulating penultimate buffer API.
+    // Because output_reserve() resizes the per-call buffer on every llama_decode() call,
+    // the penultimate embeddings from earlier calls are overwritten. These three functions
+    // provide a persistent accumulation buffer that survives across calls.
+    //
+    // Usage pattern:
+    //   llama_reset_penultimate_accum(ctx);          // clear at start of session
+    //   llama_decode(ctx, text_batch);               // intermediate flushes are automatic
+    //   llama_decode(ctx, image_batch);
+    //   llama_flush_penultimate_accum(ctx);          // flush the LAST call
+    //   float * v = llama_get_embeddings_penultimate_accum_ith(ctx, i); // read any slot
+
+    // Flush the current (last) decode call's penultimate data into the accumulation buffer.
+    // Call this ONCE after the final llama_decode in a sequence.
+    LLAMA_API void    llama_flush_penultimate_accum(struct llama_context * ctx);
+
+    // Reset the accumulation buffer. Call before starting a new decode session.
+    LLAMA_API void    llama_reset_penultimate_accum(struct llama_context * ctx);
+
+    // Return the i-th slot from the accumulated penultimate buffer.
+    // Returns NULL if i is out of range.
+    LLAMA_API float * llama_get_embeddings_penultimate_accum_ith(struct llama_context * ctx, int32_t i);
+
     // [Luna] Get the hidden state output of a specific transformer layer for the ith token.
     // Requires llama_set_layer_capture() to have been called with the layer enabled.
     // shape: [n_embd] (1-dimensional)

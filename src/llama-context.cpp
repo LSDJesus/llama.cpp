@@ -883,6 +883,44 @@ float * llama_context::get_embeddings_penultimate_ith(int32_t i) {
     }
 }
 
+// [Luna] Flush the current (last) decode call's penultimate data into the
+// accumulation buffer.  Must be called after the FINAL llama_decode in a
+// sequence; the intermediate flushes are handled automatically by output_reserve.
+void llama_context::flush_penultimate_to_accum() {
+    if (!cparams.embeddings || embd_penultimate.data == nullptr || n_outputs == 0) {
+        return;
+    }
+    synchronize();
+    const uint32_t n_embd_dim = model.hparams.n_embd;
+    const size_t   offset     = (size_t) n_penultimate_accum * n_embd_dim;
+    const size_t   count      = (size_t) n_outputs * n_embd_dim;
+    embd_penultimate_accum.resize(offset + count);
+    std::memcpy(embd_penultimate_accum.data() + offset,
+                embd_penultimate.data,
+                count * sizeof(float));
+    n_penultimate_accum += (int64_t) n_outputs;
+    // Mark as flushed so a subsequent output_reserve doesn't double-copy.
+    n_outputs = 0;
+}
+
+// [Luna] Reset the accumulation buffer (call before starting a new decode session).
+void llama_context::reset_penultimate_accum() {
+    embd_penultimate_accum.clear();
+    n_penultimate_accum = 0;
+}
+
+// [Luna] Return the i-th slot from the accumulated penultimate buffer.
+// Slots accumulate in decode-call order: first call fills slots 0..N1-1,
+// second call fills N1..N1+N2-1, etc.
+float * llama_context::get_embeddings_penultimate_accum_ith(int32_t i) {
+    const uint32_t n_embd_dim = model.hparams.n_embd;
+    if (i < 0 || (int64_t)i >= n_penultimate_accum) {
+        LLAMA_LOG_ERROR("%s: index %d out of range [0, %" PRId64 ")\n", __func__, i, n_penultimate_accum);
+        return nullptr;
+    }
+    return embd_penultimate_accum.data() + (size_t)i * n_embd_dim;
+}
+
 // [Luna] Get hidden state from a specific layer for the ith token
 float * llama_context::get_embeddings_layer_ith(int32_t layer, int32_t i) {
     output_reorder();
@@ -2024,6 +2062,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
+
+    // [Luna] Flush the previous decode call's penultimate data into the accumulation
+    // buffer BEFORE buf_output is potentially reallocated (which would null the pointer).
+    // At this point `this->n_outputs` = n_outputs_all from the previous llama_decode call.
+    if (cparams.embeddings && embd_penultimate.data != nullptr && this->n_outputs > 0) {
+        synchronize(); // ensure GPU→CPU async copies are complete
+        const uint32_t n_embd_dim = hparams.n_embd;
+        const size_t   offset     = (size_t) n_penultimate_accum * n_embd_dim;
+        const size_t   count      = (size_t) this->n_outputs * n_embd_dim;
+        embd_penultimate_accum.resize(offset + count);
+        std::memcpy(embd_penultimate_accum.data() + offset,
+                    embd_penultimate.data,
+                    count * sizeof(float));
+        n_penultimate_accum += (int64_t) this->n_outputs;
+    }
 
     const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
 
@@ -3384,6 +3437,19 @@ float * llama_get_embeddings_penultimate_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_penultimate_ith(i);
+}
+
+// [Luna] Accumulating penultimate C API
+void llama_flush_penultimate_accum(llama_context * ctx) {
+    ctx->flush_penultimate_to_accum();
+}
+
+void llama_reset_penultimate_accum(llama_context * ctx) {
+    ctx->reset_penultimate_accum();
+}
+
+float * llama_get_embeddings_penultimate_accum_ith(llama_context * ctx, int32_t i) {
+    return ctx->get_embeddings_penultimate_accum_ith(i);
 }
 
 // [Luna] Get hidden state from a specific layer for the ith token
